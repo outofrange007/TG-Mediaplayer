@@ -1,9 +1,17 @@
+import os
 import random
+
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
 from pyrogram import Client
 from pyrogram.types import Message
-import os
+from pyrogram.errors import (
+    SessionPasswordNeeded,
+    PhoneCodeInvalid,
+    PhoneCodeExpired,
+    PhoneNumberInvalid,
+    PasswordHashInvalid,
+)
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
@@ -26,25 +34,133 @@ app = FastAPI()
 # simple in-memory cache of found media messages
 media_cache: list[Message] = []
 
-@app.on_event("startup")
-async def startup():
-    await tg.start()
+# login state (used only while the Telegram session is not yet authorized)
+is_authorized = False
+login_phone_number: str | None = None
+login_phone_code_hash: str | None = None
+login_needs_password = False
+
+
+async def load_media_cache():
+    """Fetches the peer cache and all video/audio messages from the target chat."""
+    global media_cache
+
     async for _ in tg.get_dialogs():  # ensures peer/access_hash is cached
         pass
 
-    global media_cache
     media_cache = []
     async for msg in tg.get_chat_history(CHAT_ID):
         if msg.video or msg.audio:
             media_cache.append(msg)
     media_cache.reverse()
 
+
+@app.on_event("startup")
+async def startup():
+    global is_authorized
+
+    # connect() returns True if the stored session is already authorized
+    is_authorized = await tg.connect()
+
+    if is_authorized:
+        await tg.initialize()
+        await load_media_cache()
+
+
 @app.on_event("shutdown")
 async def shutdown():
-    await tg.stop()
+    if tg.is_connected:
+        await tg.stop()
+
+
+# ---------------------------------------------------------------------------
+# Login endpoints (phone number / code / 2FA password), used when the
+# Telegram session is not yet authorized. Mirrors the login flow of
+# TG-Uploader / TG-Downloader.
+# ---------------------------------------------------------------------------
+
+@app.post("/auth/send_code")
+async def auth_send_code(request: Request):
+    global login_phone_number, login_phone_code_hash, login_needs_password
+
+    data = await request.json()
+    phone_number = (data.get("phone_number") or "").strip()
+
+    if not phone_number:
+        return JSONResponse({"error": "Phone number is required."}, status_code=400)
+
+    try:
+        sent_code = await tg.send_code(phone_number)
+    except PhoneNumberInvalid:
+        return JSONResponse({"error": "Invalid phone number."}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    login_phone_number = phone_number
+    login_phone_code_hash = sent_code.phone_code_hash
+    login_needs_password = False
+
+    return JSONResponse({"success": True})
+
+
+@app.post("/auth/sign_in")
+async def auth_sign_in(request: Request):
+    global is_authorized, login_needs_password
+
+    data = await request.json()
+    code = (data.get("code") or "").strip()
+
+    if not login_phone_number or not login_phone_code_hash:
+        return JSONResponse({"error": "Please request a login code first."}, status_code=400)
+
+    try:
+        await tg.sign_in(login_phone_number, login_phone_code_hash, code)
+    except SessionPasswordNeeded:
+        login_needs_password = True
+        return JSONResponse({"need_password": True})
+    except (PhoneCodeInvalid, PhoneCodeExpired) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    await tg.initialize()
+    await load_media_cache()
+    is_authorized = True
+
+    return JSONResponse({"success": True})
+
+
+@app.post("/auth/password")
+async def auth_password(request: Request):
+    global is_authorized
+
+    data = await request.json()
+    password = data.get("password") or ""
+
+    try:
+        await tg.check_password(password)
+    except PasswordHashInvalid:
+        return JSONResponse({"error": "Incorrect password."}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    await tg.initialize()
+    await load_media_cache()
+    is_authorized = True
+
+    return JSONResponse({"success": True})
+
+
+@app.get("/auth/status")
+async def auth_status():
+    return JSONResponse({"authorized": is_authorized})
+
 
 @app.get("/api/playlist")
 async def playlist(shuffle: bool = False):
+    if not is_authorized:
+        return JSONResponse({"error": "not authorized"}, status_code=401)
+
     items = [
         {
             "id": msg.id,
@@ -63,6 +179,9 @@ CHUNK_SIZE = 1024 * 1024  # Telegram requires offsets aligned to 1 MB
 
 @app.get("/media/{message_id}")
 async def stream(message_id: int, request: Request):
+    if not is_authorized:
+        return JSONResponse({"error": "not authorized"}, status_code=401)
+
     msg = next((m for m in media_cache if m.id == message_id), None)
     if not msg:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -117,21 +236,338 @@ async def stream(message_id: int, request: Request):
         media_type=mime_type,
     )
 
-    async def chunk_generator():
-        # stream only the requested byte range from Telegram, chunk by chunk
-        async for chunk in tg.stream_media(msg, offset=start, limit=chunk_size):
-            yield chunk
-
-    headers = {
-        "Content-Range": f"bytes {start}-{end}/{file_size}",
-        "Accept-Ranges": "bytes",
-        "Content-Length": str(chunk_size),
-    }
-    status_code = 206 if range_header else 200
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return """
+    if not is_authorized:
+        return LOGIN_PAGE
+    return PLAYER_PAGE
+
+
+LOGIN_PAGE = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Telegram Media Player - Login</title>
+        <link rel="stylesheet"
+              href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                background: #1a1a1a;
+                min-height: 100vh;
+                color: #e0e0e0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+
+            .login-container {
+                width: 100%;
+                max-width: 420px;
+                padding: 30px;
+            }
+
+            header {
+                text-align: center;
+                margin-bottom: 25px;
+                color: #fff;
+            }
+
+            h1 {
+                font-size: 1.8rem;
+                margin-bottom: 8px;
+            }
+
+            .subtitle {
+                color: #8899a6;
+                font-size: 0.9rem;
+            }
+
+            .section {
+                background: rgba(255, 255, 255, 0.03);
+                backdrop-filter: blur(10px);
+                border: 1px solid rgba(255, 255, 255, 0.05);
+                border-radius: 10px;
+                padding: 25px;
+                box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+            }
+
+            .section h2 {
+                color: #6ca6fd;
+                margin-bottom: 18px;
+                font-size: 1.1rem;
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            }
+
+            label {
+                display: block;
+                margin-bottom: 8px;
+                color: #8899a6;
+                font-size: 0.9rem;
+            }
+
+            input[type="text"],
+            input[type="password"] {
+                width: 100%;
+                padding: 11px 14px;
+                border-radius: 6px;
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                background: rgba(0, 0, 0, 0.25);
+                color: #e0e0e0;
+                font-size: 1rem;
+                margin-bottom: 18px;
+            }
+
+            input[type="text"]:focus,
+            input[type="password"]:focus {
+                outline: none;
+                border-color: rgba(108, 166, 253, 0.6);
+            }
+
+            .btn {
+                width: 100%;
+                background: rgba(108, 166, 253, 0.2);
+                color: #6ca6fd;
+                border: 1px solid rgba(108, 166, 253, 0.3);
+                padding: 12px 18px;
+                border-radius: 6px;
+                cursor: pointer;
+                font-weight: 500;
+                font-size: 1rem;
+                transition: all 0.2s ease;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                gap: 8px;
+            }
+
+            .btn:hover {
+                background: rgba(108, 166, 253, 0.3);
+                transform: translateY(-1px);
+            }
+
+            .btn:disabled {
+                opacity: 0.5;
+                cursor: not-allowed;
+                transform: none;
+            }
+
+            .step {
+                display: none;
+            }
+
+            .step.active {
+                display: block;
+            }
+
+            .message {
+                margin-top: 14px;
+                padding: 10px 12px;
+                border-radius: 6px;
+                font-size: 0.88rem;
+                display: none;
+            }
+
+            .message.error {
+                display: block;
+                background: rgba(255, 90, 90, 0.12);
+                border: 1px solid rgba(255, 90, 90, 0.3);
+                color: #ff8a8a;
+            }
+
+            .message.success {
+                display: block;
+                background: rgba(108, 253, 150, 0.12);
+                border: 1px solid rgba(108, 253, 150, 0.3);
+                color: #8afcae;
+            }
+        </style>
+    </head>
+
+    <body>
+        <main class="login-container">
+            <header>
+                <h1>
+                    <i class="fas fa-circle-play" style="color: #6ca6fd;"></i>
+                    Telegram Media Player
+                </h1>
+                <p class="subtitle">Sign in with your Telegram account to continue</p>
+            </header>
+
+            <section class="section">
+                <div id="step-phone" class="step active">
+                    <h2><i class="fas fa-phone"></i> Phone Number</h2>
+                    <label for="phone-input">Phone number (with country code)</label>
+                    <input type="text" id="phone-input" placeholder="+49 151 23456789" autocomplete="tel">
+                    <button class="btn" id="send-code-btn" onclick="sendCode()">
+                        <i class="fas fa-paper-plane"></i> Send Code
+                    </button>
+                </div>
+
+                <div id="step-code" class="step">
+                    <h2><i class="fas fa-key"></i> Login Code</h2>
+                    <label for="code-input">Enter the code sent to your Telegram app</label>
+                    <input type="text" id="code-input" placeholder="12345" autocomplete="one-time-code">
+                    <button class="btn" id="sign-in-btn" onclick="signIn()">
+                        <i class="fas fa-right-to-bracket"></i> Confirm Code
+                    </button>
+                </div>
+
+                <div id="step-password" class="step">
+                    <h2><i class="fas fa-lock"></i> Two-Factor Password</h2>
+                    <label for="password-input">Enter your Telegram cloud password</label>
+                    <input type="password" id="password-input" placeholder="Password" autocomplete="current-password">
+                    <button class="btn" id="password-btn" onclick="submitPassword()">
+                        <i class="fas fa-unlock"></i> Confirm Password
+                    </button>
+                </div>
+
+                <div id="message" class="message"></div>
+            </section>
+        </main>
+
+        <script>
+            function showMessage(text, type) {
+                const el = document.getElementById("message");
+                el.textContent = text;
+                el.className = `message ${type}`;
+            }
+
+            function clearMessage() {
+                const el = document.getElementById("message");
+                el.textContent = "";
+                el.className = "message";
+            }
+
+            function showStep(stepId) {
+                document.querySelectorAll(".step").forEach((el) => el.classList.remove("active"));
+                document.getElementById(stepId).classList.add("active");
+            }
+
+            async function sendCode() {
+                clearMessage();
+                const phoneNumber = document.getElementById("phone-input").value.trim();
+
+                if (!phoneNumber) {
+                    showMessage("Please enter a phone number.", "error");
+                    return;
+                }
+
+                const btn = document.getElementById("send-code-btn");
+                btn.disabled = true;
+
+                try {
+                    const response = await fetch("/auth/send_code", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ phone_number: phoneNumber }),
+                    });
+                    const result = await response.json();
+
+                    if (!response.ok || result.error) {
+                        showMessage(result.error || "Could not send the login code.", "error");
+                        return;
+                    }
+
+                    showStep("step-code");
+                } catch (error) {
+                    showMessage("Network error while sending the code.", "error");
+                } finally {
+                    btn.disabled = false;
+                }
+            }
+
+            async function signIn() {
+                clearMessage();
+                const code = document.getElementById("code-input").value.trim();
+
+                if (!code) {
+                    showMessage("Please enter the login code.", "error");
+                    return;
+                }
+
+                const btn = document.getElementById("sign-in-btn");
+                btn.disabled = true;
+
+                try {
+                    const response = await fetch("/auth/sign_in", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ code: code }),
+                    });
+                    const result = await response.json();
+
+                    if (!response.ok || result.error) {
+                        showMessage(result.error || "Invalid code.", "error");
+                        return;
+                    }
+
+                    if (result.need_password) {
+                        showStep("step-password");
+                        return;
+                    }
+
+                    showMessage("Login successful! Loading player...", "success");
+                    setTimeout(() => window.location.reload(), 1000);
+                } catch (error) {
+                    showMessage("Network error while confirming the code.", "error");
+                } finally {
+                    btn.disabled = false;
+                }
+            }
+
+            async function submitPassword() {
+                clearMessage();
+                const password = document.getElementById("password-input").value;
+
+                if (!password) {
+                    showMessage("Please enter your password.", "error");
+                    return;
+                }
+
+                const btn = document.getElementById("password-btn");
+                btn.disabled = true;
+
+                try {
+                    const response = await fetch("/auth/password", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ password: password }),
+                    });
+                    const result = await response.json();
+
+                    if (!response.ok || result.error) {
+                        showMessage(result.error || "Incorrect password.", "error");
+                        return;
+                    }
+
+                    showMessage("Login successful! Loading player...", "success");
+                    setTimeout(() => window.location.reload(), 1000);
+                } catch (error) {
+                    showMessage("Network error while confirming the password.", "error");
+                } finally {
+                    btn.disabled = false;
+                }
+            }
+        </script>
+    </body>
+    </html>
+"""
+
+
+PLAYER_PAGE = """
     <!DOCTYPE html>
     <html lang="en">
     <head>
@@ -225,7 +661,7 @@ async def index():
             .btn.active {
                 background: rgba(108, 166, 253, 0.35);
                 border-color: rgba(108, 166, 253, 0.7);
-                color: #ffffff;
+                color: #ffff;
             }
 
             #player-container {
@@ -264,7 +700,7 @@ async def index():
                 bottom: 80px;
                 padding: 9px 13px;
                 background: rgba(0, 0, 0, 0.68);
-                color: #ffffff;
+                color: #ffff;
                 border: 1px solid rgba(255, 255, 255, 0.2);
                 border-radius: 6px;
                 cursor: pointer;
@@ -402,11 +838,11 @@ async def index():
                 <h2><i class="fas fa-sliders"></i> Playback Controls</h2>
                 <div class="button-row">
                     <button id="normal-order-btn" class="btn active" onclick="loadPlaylist(false)">
-                        <i class="fas fa-list"></i> Normal Order
+                    <i class="fas fa-list"></i> Normal Order
                     </button>
 
                     <button id="shuffle-btn" class="btn" onclick="loadPlaylist(true)">
-                        <i class="fas fa-shuffle"></i> Shuffle Mode
+                    <i class="fas fa-shuffle"></i> Shuffle Mode
                     </button>
                 </div>
             </section>
@@ -418,11 +854,11 @@ async def index():
                     <video id="player" controls controlsList="nofullscreen"></video>
 
                     <button id="fullscreen-btn" title="Toggle fullscreen" onclick="toggleFullscreen()">
-                        <i class="fas fa-expand"></i>
+                    <i class="fas fa-expand"></i>
                     </button>
 
                     <button id="next-overlay-btn" title="Play next item" onclick="playNext()">
-                        <i class="fas fa-forward-step"></i>
+                    <i class="fas fa-forward-step"></i>
                     </button>
                 </div>
 
@@ -435,7 +871,7 @@ async def index():
                 <h2><i class="fas fa-list-ul"></i> Playlist</h2>
                 <ul id="playlist">
                     <li class="empty-playlist">
-                        <i class="fas fa-spinner fa-spin"></i> Loading playlist...
+                    <i class="fas fa-spinner fa-spin"></i> Loading playlist...
                     </li>
                 </ul>
             </section>
@@ -455,7 +891,7 @@ async def index():
                 const playlistElement = document.getElementById("playlist");
                 playlistElement.innerHTML = `
                     <li class="empty-playlist">
-                        <i class="fas fa-spinner fa-spin"></i> Loading playlist...
+                    <i class="fas fa-spinner fa-spin"></i> Loading playlist...
                     </li>
                 `;
 
@@ -467,17 +903,17 @@ async def index():
                     renderList();
 
                     if (items.length > 0) {
-                        playItem(0);
+                    playItem(0);
                     } else {
-                        document.getElementById("now-playing").innerHTML =
-                            "<strong>Now playing:</strong> No media files found";
+                    document.getElementById("now-playing").innerHTML =
+                    "<strong>Now playing:</strong> No media files found";
                     }
                 } catch (error) {
                     playlistElement.innerHTML = `
-                        <li class="empty-playlist">
-                            <i class="fas fa-triangle-exclamation"></i>
-                            Could not load the playlist.
-                        </li>
+                    <li class="empty-playlist">
+                    <i class="fas fa-triangle-exclamation"></i>
+                    Could not load the playlist.
+                    </li>
                     `;
                 }
             }
@@ -488,9 +924,9 @@ async def index():
 
                 if (items.length === 0) {
                     playlistElement.innerHTML = `
-                        <li class="empty-playlist">
-                            <i class="fas fa-folder-open"></i> No media files found.
-                        </li>
+                    <li class="empty-playlist">
+                    <i class="fas fa-folder-open"></i> No media files found.
+                    </li>
                     `;
                     return;
                 }
@@ -501,9 +937,9 @@ async def index():
 
                     listItem.className = `playlist-item ${index === currentIndex ? "active" : ""}`;
                     listItem.innerHTML = `
-                        <i class="fas ${icon} playlist-icon"></i>
-                        <span class="playlist-name">${escapeHtml(item.name)}</span>
-                        <span class="playlist-size">${formatFileSize(item.size)}</span>
+                    <i class="fas ${icon} playlist-icon"></i>
+                    <span class="playlist-name">${escapeHtml(item.name)}</span>
+                    <span class="playlist-size">${formatFileSize(item.size)}</span>
                     `;
 
                     listItem.onclick = () => playItem(index);
@@ -548,7 +984,7 @@ async def index():
 
                 if (!document.fullscreenElement) {
                     container.requestFullscreen().catch(() => {
-                        // Fullscreen may be blocked by browser settings.
+                    // Fullscreen may be blocked by browser settings.
                     });
                 } else {
                     document.exitFullscreen();
@@ -585,4 +1021,4 @@ async def index():
         </script>
     </body>
     </html>
-    """
+"""
