@@ -129,13 +129,6 @@ async def stream(message_id: int, request: Request):
     }
     status_code = 206 if range_header else 200
 
-    return StreamingResponse(
-        chunk_generator(),
-        status_code=status_code,
-        headers=headers,
-        media_type=mime_type,
-    )
-
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return """
