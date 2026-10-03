@@ -1,0 +1,19 @@
+services:
+  telegram-media-player:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: telegram_media_player
+    restart: unless-stopped
+
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+
+    env_file:
+      - .env
+
+    volumes:
+      - ./data:/app/data
+
+    environment:
+      - TZ=Europe/Berlin
