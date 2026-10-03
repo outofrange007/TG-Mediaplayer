@@ -1,4 +1,5 @@
 import os
+import json
 import random
 
 from fastapi import FastAPI, Request
@@ -22,6 +23,9 @@ SESSION_NAME = os.getenv("SESSION_NAME", "media_player_session")
 
 os.makedirs(DATA_PATH, exist_ok=True)
 
+# file used to persist the list of media message IDs between restarts
+CACHE_FILE = os.path.join(DATA_PATH, "media_cache.json")
+
 tg = Client(
     SESSION_NAME,
     api_id=API_ID,
@@ -41,18 +45,57 @@ login_phone_code_hash: str | None = None
 login_needs_password = False
 
 
-async def load_media_cache():
-    """Fetches the peer cache and all video/audio messages from the target chat."""
+def save_cache_to_disk():
+    """Persists the IDs of the currently known media messages to disk."""
+    ids = [msg.id for msg in media_cache]
+    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(ids, f)
+
+
+async def scan_telegram_media():
+    """Performs a full scan of the chat history (slow, rate-limited by Telegram)."""
     global media_cache
 
     async for _ in tg.get_dialogs():  # ensures peer/access_hash is cached
         pass
 
-    media_cache = []
+    found = []
     async for msg in tg.get_chat_history(CHAT_ID):
         if msg.video or msg.audio:
-            media_cache.append(msg)
-    media_cache.reverse()
+            found.append(msg)
+    found.reverse()
+
+    media_cache = found
+    save_cache_to_disk()
+
+
+async def load_media_cache():
+    """
+    Fast startup path: if a cached list of message IDs exists on disk, fetch
+    only those specific messages instead of scanning the entire chat history.
+    Falls back to a full scan if no cache is available yet.
+    """
+    global media_cache
+
+    async for _ in tg.get_dialogs():  # ensures peer/access_hash is cached
+        pass
+
+    if not os.path.exists(CACHE_FILE):
+        await scan_telegram_media()
+        return
+
+    with open(CACHE_FILE, "r", encoding="utf-8") as f:
+        cached_ids = json.load(f)
+
+    messages = []
+    # get_messages accepts up to 200 IDs per call, so this stays fast
+    # and avoids the per-request flood-wait delays of get_chat_history.
+    for i in range(0, len(cached_ids), 200):
+        chunk = await tg.get_messages(CHAT_ID, cached_ids[i:i + 200])
+        chunk = chunk if isinstance(chunk, list) else [chunk]
+        messages.extend(m for m in chunk if m and (m.video or m.audio))
+
+    media_cache = messages
 
 
 @app.on_event("startup")
@@ -154,6 +197,16 @@ async def auth_password(request: Request):
 @app.get("/auth/status")
 async def auth_status():
     return JSONResponse({"authorized": is_authorized})
+
+
+@app.post("/api/refresh")
+async def refresh_media():
+    """Triggers a full re-scan of the Telegram chat and updates the cache on disk."""
+    if not is_authorized:
+        return JSONResponse({"error": "not authorized"}, status_code=401)
+
+    await scan_telegram_media()
+    return JSONResponse({"success": True, "count": len(media_cache)})
 
 
 @app.get("/api/playlist")
@@ -664,6 +717,25 @@ PLAYER_PAGE = """
                 color: #ffff;
             }
 
+            .btn:disabled {
+                opacity: 0.5;
+                cursor: not-allowed;
+                transform: none;
+            }
+
+            .btn.spinning i {
+                animation: spin 1s linear infinite;
+            }
+
+            @keyframes spin {
+                from {
+                    transform: rotate(0deg);
+                }
+                to {
+                    transform: rotate(360deg);
+                }
+            }
+
             #player-container {
                 position: relative;
                 width: 100%;
@@ -851,6 +923,10 @@ PLAYER_PAGE = """
                     <button id="shuffle-btn" class="btn" onclick="loadPlaylist(true)">
                     <i class="fas fa-shuffle"></i> Shuffle Mode
                     </button>
+
+                    <button id="refresh-btn" class="btn" onclick="refreshMedia()">
+                    <i class="fas fa-rotate"></i> Refresh Media List
+                    </button>
                 </div>
             </section>
 
@@ -997,6 +1073,29 @@ PLAYER_PAGE = """
 
                 const prevIndex = (currentIndex - 1 + items.length) % items.length;
                 playItem(prevIndex);
+            }
+
+            async function refreshMedia() {
+                const btn = document.getElementById("refresh-btn");
+                btn.disabled = true;
+                btn.classList.add("spinning");
+
+                try {
+                    const response = await fetch("/api/refresh", { method: "POST" });
+                    const result = await response.json();
+
+                    if (!response.ok || result.error) {
+                    alert(result.error || "Could not refresh the media list.");
+                    return;
+                    }
+
+                    await loadPlaylist(shuffleEnabled);
+                } catch (error) {
+                    alert("Network error while refreshing the media list.");
+                } finally {
+                    btn.disabled = false;
+                    btn.classList.remove("spinning");
+                }
             }
 
             function toggleFullscreen() {
