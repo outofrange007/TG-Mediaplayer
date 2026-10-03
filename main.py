@@ -1,6 +1,7 @@
 import os
 import json
 import random
+from collections import OrderedDict
 
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
@@ -23,7 +24,7 @@ SESSION_NAME = os.getenv("SESSION_NAME", "media_player_session")
 
 os.makedirs(DATA_PATH, exist_ok=True)
 
-# file used to persist the list of media message IDs between restarts
+# file used to persist the media list (with metadata) between restarts
 CACHE_FILE = os.path.join(DATA_PATH, "media_cache.json")
 
 tg = Client(
@@ -35,8 +36,12 @@ tg = Client(
 
 app = FastAPI()
 
-# simple in-memory cache of found media messages
-media_cache: list[Message] = []
+# media list: plain dicts {id, name, type, size, mime} - no Telegram calls needed to build it
+media_items: list[dict] = []
+
+# small LRU cache of Message objects, only used for streaming
+message_cache: "OrderedDict[int, Message]" = OrderedDict()
+MESSAGE_CACHE_LIMIT = 50
 
 # login state (used only while the Telegram session is not yet authorized)
 is_authorized = False
@@ -45,16 +50,51 @@ login_phone_code_hash: str | None = None
 login_needs_password = False
 
 
+def message_to_item(msg: Message) -> dict:
+    file_obj = msg.video or msg.audio
+    return {
+        "id": msg.id,
+        "name": file_obj.file_name or f"File {msg.id}",
+        "type": "video" if msg.video else "audio",
+        "size": file_obj.file_size or 0,
+        "mime": file_obj.mime_type or "application/octet-stream",
+    }
+
+
 def save_cache_to_disk():
-    """Persists the IDs of the currently known media messages to disk."""
-    ids = [msg.id for msg in media_cache]
-    with open(CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump(ids, f)
+    """Persists the full media list (including metadata) to disk."""
+    tmp_file = CACHE_FILE + ".tmp"
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        json.dump(media_items, f)
+    os.replace(tmp_file, CACHE_FILE)  # atomic write
+
+
+def load_cache_from_disk() -> bool:
+    """
+    Loads the media list from disk. Returns False if there is no usable cache
+    (missing, corrupt, or old format that only contained message IDs).
+    """
+    global media_items
+
+    if not os.path.exists(CACHE_FILE):
+        return False
+
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return False
+
+    if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+        return False
+
+    media_items = data
+    return True
 
 
 async def scan_telegram_media():
-    """Performs a full scan of the chat history (slow, rate-limited by Telegram)."""
-    global media_cache
+    """Full scan of the chat history (slow, rate-limited). Only runs on first start or on manual refresh."""
+    global media_items
 
     async for _ in tg.get_dialogs():  # ensures peer/access_hash is cached
         pass
@@ -62,40 +102,42 @@ async def scan_telegram_media():
     found = []
     async for msg in tg.get_chat_history(CHAT_ID):
         if msg.video or msg.audio:
-            found.append(msg)
+            found.append(message_to_item(msg))
     found.reverse()
 
-    media_cache = found
+    media_items = found
+    message_cache.clear()
     save_cache_to_disk()
 
 
 async def load_media_cache():
-    """
-    Fast startup path: if a cached list of message IDs exists on disk, fetch
-    only those specific messages instead of scanning the entire chat history.
-    Falls back to a full scan if no cache is available yet.
-    """
-    global media_cache
-
-    async for _ in tg.get_dialogs():  # ensures peer/access_hash is cached
-        pass
-
-    if not os.path.exists(CACHE_FILE):
-        await scan_telegram_media()
+    """Instant startup if a valid cache exists; otherwise one full scan."""
+    if load_cache_from_disk():
         return
+    await scan_telegram_media()
 
-    with open(CACHE_FILE, "r", encoding="utf-8") as f:
-        cached_ids = json.load(f)
 
-    messages = []
-    # get_messages accepts up to 200 IDs per call, so this stays fast
-    # and avoids the per-request flood-wait delays of get_chat_history.
-    for i in range(0, len(cached_ids), 200):
-        chunk = await tg.get_messages(CHAT_ID, cached_ids[i:i + 200])
-        chunk = chunk if isinstance(chunk, list) else [chunk]
-        messages.extend(m for m in chunk if m and (m.video or m.audio))
+async def get_message(message_id: int) -> Message | None:
+    """Fetches a single message on demand (used for streaming)."""
+    if message_id in message_cache:
+        message_cache.move_to_end(message_id)
+        return message_cache[message_id]
 
-    media_cache = messages
+    try:
+        msg = await tg.get_messages(CHAT_ID, message_id)
+    except Exception:
+        # peer might not be known yet in the session -> load dialogs once and retry
+        async for _ in tg.get_dialogs():
+            pass
+        msg = await tg.get_messages(CHAT_ID, message_id)
+
+    if not msg or not (msg.video or msg.audio):
+        return None
+
+    message_cache[message_id] = msg
+    if len(message_cache) > MESSAGE_CACHE_LIMIT:
+        message_cache.popitem(last=False)
+    return msg
 
 
 @app.on_event("startup")
@@ -118,8 +160,7 @@ async def shutdown():
 
 # ----
 # Login endpoints (phone number / code / 2FA password), used when the
-# Telegram session is not yet authorized. Mirrors the login flow of
-# TG-Uploader / TG-Downloader.
+# Telegram session is not yet authorized.
 # ----
 
 @app.post("/auth/send_code")
@@ -206,7 +247,7 @@ async def refresh_media():
         return JSONResponse({"error": "not authorized"}, status_code=401)
 
     await scan_telegram_media()
-    return JSONResponse({"success": True, "count": len(media_cache)})
+    return JSONResponse({"success": True, "count": len(media_items)})
 
 
 @app.get("/api/playlist")
@@ -215,17 +256,13 @@ async def playlist(shuffle: bool = False):
         return JSONResponse({"error": "not authorized"}, status_code=401)
 
     items = [
-        {
-            "id": msg.id,
-            "name": (msg.video.file_name if msg.video else msg.audio.file_name) or f"File {msg.id}",
-            "type": "video" if msg.video else "audio",
-            "size": (msg.video.file_size if msg.video else msg.audio.file_size),
-        }
-        for msg in media_cache
+        {"id": i["id"], "name": i["name"], "type": i["type"], "size": i["size"]}
+        for i in media_items
     ]
     if shuffle:
         random.shuffle(items)
     return JSONResponse(items)
+
 
 CHUNK_SIZE = 1024 * 1024  # Telegram requires offsets aligned to 1 MB
 
@@ -235,13 +272,16 @@ async def stream(message_id: int, request: Request):
     if not is_authorized:
         return JSONResponse({"error": "not authorized"}, status_code=401)
 
-    msg = next((m for m in media_cache if m.id == message_id), None)
-    if not msg:
+    item = next((i for i in media_items if i["id"] == message_id), None)
+    if not item:
         return JSONResponse({"error": "not found"}, status_code=404)
 
-    file_obj = msg.video or msg.audio
-    file_size = file_obj.file_size
-    mime_type = file_obj.mime_type or "application/octet-stream"
+    msg = await get_message(message_id)
+    if not msg:
+        return JSONResponse({"error": "message no longer available"}, status_code=404)
+
+    file_size = item["size"]
+    mime_type = item["mime"]
 
     range_header = request.headers.get("range")
     start = 0
@@ -288,7 +328,6 @@ async def stream(message_id: int, request: Request):
         headers=headers,
         media_type=mime_type,
     )
-
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
