@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
+COPY list_chats.py .
 
 RUN mkdir -p /app/data \
     && chown -R appuser:appuser /app
