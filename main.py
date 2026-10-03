@@ -73,11 +73,11 @@ async def shutdown():
         await tg.stop()
 
 
-# ---------------------------------------------------------------------------
+# ----
 # Login endpoints (phone number / code / 2FA password), used when the
 # Telegram session is not yet authorized. Mirrors the login flow of
 # TG-Uploader / TG-Downloader.
-# ---------------------------------------------------------------------------
+# ----
 
 @app.post("/auth/send_code")
 async def auth_send_code(request: Request):
@@ -412,7 +412,7 @@ LOGIN_PAGE = """
                     <label for="phone-input">Phone number (with country code)</label>
                     <input type="text" id="phone-input" placeholder="+49 151 23456789" autocomplete="tel">
                     <button class="btn" id="send-code-btn" onclick="sendCode()">
-                        <i class="fas fa-paper-plane"></i> Send Code
+                    <i class="fas fa-paper-plane"></i> Send Code
                     </button>
                 </div>
 
@@ -421,7 +421,7 @@ LOGIN_PAGE = """
                     <label for="code-input">Enter the code sent to your Telegram app</label>
                     <input type="text" id="code-input" placeholder="12345" autocomplete="one-time-code">
                     <button class="btn" id="sign-in-btn" onclick="signIn()">
-                        <i class="fas fa-right-to-bracket"></i> Confirm Code
+                    <i class="fas fa-right-to-bracket"></i> Confirm Code
                     </button>
                 </div>
 
@@ -430,7 +430,7 @@ LOGIN_PAGE = """
                     <label for="password-input">Enter your Telegram cloud password</label>
                     <input type="password" id="password-input" placeholder="Password" autocomplete="current-password">
                     <button class="btn" id="password-btn" onclick="submitPassword()">
-                        <i class="fas fa-unlock"></i> Confirm Password
+                    <i class="fas fa-unlock"></i> Confirm Password
                     </button>
                 </div>
 
@@ -470,15 +470,15 @@ LOGIN_PAGE = """
 
                 try {
                     const response = await fetch("/auth/send_code", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ phone_number: phoneNumber }),
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ phone_number: phoneNumber }),
                     });
                     const result = await response.json();
 
                     if (!response.ok || result.error) {
-                        showMessage(result.error || "Could not send the login code.", "error");
-                        return;
+                    showMessage(result.error || "Could not send the login code.", "error");
+                    return;
                     }
 
                     showStep("step-code");
@@ -503,20 +503,20 @@ LOGIN_PAGE = """
 
                 try {
                     const response = await fetch("/auth/sign_in", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ code: code }),
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ code: code }),
                     });
                     const result = await response.json();
 
                     if (!response.ok || result.error) {
-                        showMessage(result.error || "Invalid code.", "error");
-                        return;
+                    showMessage(result.error || "Invalid code.", "error");
+                    return;
                     }
 
                     if (result.need_password) {
-                        showStep("step-password");
-                        return;
+                    showStep("step-password");
+                    return;
                     }
 
                     showMessage("Login successful! Loading player...", "success");
@@ -542,15 +542,15 @@ LOGIN_PAGE = """
 
                 try {
                     const response = await fetch("/auth/password", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ password: password }),
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ password: password }),
                     });
                     const result = await response.json();
 
                     if (!response.ok || result.error) {
-                        showMessage(result.error || "Incorrect password.", "error");
-                        return;
+                    showMessage(result.error || "Incorrect password.", "error");
+                    return;
                     }
 
                     showMessage("Login successful! Loading player...", "success");
@@ -694,6 +694,7 @@ PLAYER_PAGE = """
                 object-fit: contain;
             }
 
+            #prev-overlay-btn,
             #next-overlay-btn,
             #fullscreen-btn {
                 position: absolute;
@@ -718,6 +719,11 @@ PLAYER_PAGE = """
                 right: 70px;
             }
 
+            #prev-overlay-btn {
+                right: 124px;
+            }
+
+            #prev-overlay-btn:hover,
             #next-overlay-btn:hover,
             #fullscreen-btn:hover {
                 opacity: 1;
@@ -816,6 +822,7 @@ PLAYER_PAGE = """
                     justify-content: center;
                 }
 
+                #prev-overlay-btn,
                 #next-overlay-btn,
                 #fullscreen-btn {
                     bottom: 65px;
@@ -855,6 +862,10 @@ PLAYER_PAGE = """
 
                     <button id="fullscreen-btn" title="Toggle fullscreen" onclick="toggleFullscreen()">
                     <i class="fas fa-expand"></i>
+                    </button>
+
+                    <button id="prev-overlay-btn" title="Play previous item" onclick="playPrevious()">
+                    <i class="fas fa-backward-step"></i>
                     </button>
 
                     <button id="next-overlay-btn" title="Play next item" onclick="playNext()">
@@ -977,6 +988,15 @@ PLAYER_PAGE = """
 
                 const nextIndex = (currentIndex + 1) % items.length;
                 playItem(nextIndex);
+            }
+
+            function playPrevious() {
+                if (items.length === 0) {
+                    return;
+                }
+
+                const prevIndex = (currentIndex - 1 + items.length) % items.length;
+                playItem(prevIndex);
             }
 
             function toggleFullscreen() {
