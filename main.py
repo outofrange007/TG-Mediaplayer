@@ -7,6 +7,9 @@ from urllib.parse import quote
 
 from fastapi import FastAPI, Request, Query
 from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
+import base64
+from pyrogram.raw import functions, types as raw_types
+from pyrogram.session import Auth, Session
 from pyrogram import Client
 from pyrogram.enums import ChatType
 from pyrogram.types import Message
@@ -360,6 +363,84 @@ async def auth_password(request: Request):
 
     return JSONResponse({"success": True})
 
+# ----
+# QR code login (alternative to phone number + code)
+# ----
+
+qr_lock = asyncio.Lock()
+
+
+def qr_login_url(token: bytes) -> str:
+    """Builds the tg://login URL that the Telegram app understands."""
+    return "tg://login?token=" + base64.urlsafe_b64encode(token).decode().rstrip("=")
+
+
+async def export_login_token():
+    return await tg.invoke(
+        functions.auth.ExportLoginToken(api_id=API_ID, api_hash=API_HASH, except_ids=[])
+    )
+
+
+async def migrate_to_dc(dc_id: int) -> None:
+    """Switches the client session to another Telegram data center (same steps Pyrogram uses internally)."""
+    await tg.session.stop()
+    await tg.storage.dc_id(dc_id)
+    await tg.storage.auth_key(
+        await Auth(tg, await tg.storage.dc_id(), await tg.storage.test_mode()).create()
+    )
+    tg.session = Session(
+        tg,
+        await tg.storage.dc_id(),
+        await tg.storage.auth_key(),
+        await tg.storage.test_mode(),
+    )
+    await tg.session.start()
+
+
+async def finish_qr_login(authorization) -> None:
+    global is_authorized
+
+    await tg.storage.user_id(authorization.user.id)
+    await tg.storage.is_bot(False)
+
+    await tg.initialize()
+    await load_media_cache()
+    is_authorized = True
+
+@app.get("/auth/qr_status")
+async def auth_qr_status():
+    """
+    Polled by the login page every few seconds. Returns the current QR URL
+    (it changes about every 30 seconds) until the code has been scanned.
+    """
+    if is_authorized:
+        return JSONResponse({"authorized": True})
+
+    async with qr_lock:
+        if is_authorized:
+            return JSONResponse({"authorized": True})
+
+        try:
+            result = await export_login_token()
+
+            if isinstance(result, raw_types.auth.LoginTokenMigrateTo):
+                await migrate_to_dc(result.dc_id)
+                result = await tg.invoke(functions.auth.ImportLoginToken(token=result.token))
+
+            if isinstance(result, raw_types.auth.LoginTokenSuccess):
+                await finish_qr_login(result.authorization)
+                return JSONResponse({"authorized": True})
+
+            if isinstance(result, raw_types.auth.LoginToken):
+                return JSONResponse({"url": qr_login_url(result.token)})
+
+            return JSONResponse({"error": "Unexpected response from Telegram."}, status_code=400)
+
+        except SessionPasswordNeeded:
+            # QR was scanned, but the account has a cloud password -> /auth/password finishes the login
+            return JSONResponse({"need_password": True})
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
 
 @app.get("/auth/status")
 async def auth_status():
@@ -546,6 +627,7 @@ LOGIN_PAGE = """
         <title>Telegram Media Player - Login</title>
         <link rel="stylesheet"
               href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 
         <style>
             * {
@@ -602,6 +684,34 @@ LOGIN_PAGE = """
                 display: flex;
                 align-items: center;
                 gap: 10px;
+            }
+
+            .mode-tabs {
+                display: flex;
+                gap: 8px;
+                margin-bottom: 20px;
+            }
+
+            .mode-tab {
+                flex: 1;
+                background: rgba(255, 255, 255, 0.03);
+                color: #8899a6;
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                padding: 9px 12px;
+                border-radius: 6px;
+                cursor: pointer;
+                font-size: 0.9rem;
+                transition: all 0.2s ease;
+            }
+
+            .mode-tab:hover {
+                background: rgba(108, 166, 253, 0.12);
+            }
+
+            .mode-tab.active {
+                background: rgba(108, 166, 253, 0.25);
+                border-color: rgba(108, 166, 253, 0.6);
+                color: #fff;
             }
 
             label {
@@ -665,6 +775,31 @@ LOGIN_PAGE = """
                 display: block;
             }
 
+            #qr-box {
+                width: 232px;
+                height: 232px;
+                margin: 0 auto 16px auto;
+                padding: 8px;
+                background: #ffffff;
+                border-radius: 8px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: #555;
+            }
+
+            #qr-code img,
+            #qr-code canvas {
+                display: block;
+            }
+
+            .qr-hint {
+                color: #8899a6;
+                font-size: 0.85rem;
+                text-align: center;
+                line-height: 1.5;
+            }
+
             .message {
                 margin-top: 14px;
                 padding: 10px 12px;
@@ -700,6 +835,15 @@ LOGIN_PAGE = """
             </header>
 
             <section class="section">
+                <div id="mode-tabs" class="mode-tabs">
+                    <button class="mode-tab active" id="tab-phone" onclick="setMode('phone')">
+                    <i class="fas fa-phone"></i> Phone number
+                    </button>
+                    <button class="mode-tab" id="tab-qr" onclick="setMode('qr')">
+                    <i class="fas fa-qrcode"></i> QR code
+                    </button>
+                </div>
+
                 <div id="step-phone" class="step active">
                     <h2><i class="fas fa-phone"></i> Phone Number</h2>
                     <label for="phone-input">Phone number (with country code)</label>
@@ -718,6 +862,19 @@ LOGIN_PAGE = """
                     </button>
                 </div>
 
+                <div id="step-qr" class="step">
+                    <h2><i class="fas fa-qrcode"></i> Scan QR Code</h2>
+                    <div id="qr-box">
+                    <span id="qr-loading"><i class="fas fa-spinner fa-spin"></i> Loading...</span>
+                    <div id="qr-code"></div>
+                    </div>
+                    <p class="qr-hint">
+                    Open Telegram on your phone, go to
+                    <strong>Settings &rarr; Devices &rarr; Link Desktop Device</strong>
+                    and scan this code. It refreshes automatically.
+                    </p>
+                </div>
+
                 <div id="step-password" class="step">
                     <h2><i class="fas fa-lock"></i> Two-Factor Password</h2>
                     <label for="password-input">Enter your Telegram cloud password</label>
@@ -732,6 +889,11 @@ LOGIN_PAGE = """
         </main>
 
         <script>
+            let qrObject = null;
+            let qrLastUrl = null;
+            let qrPolling = false;
+            let qrTimer = null;
+
             function showMessage(text, type) {
                 const el = document.getElementById("message");
                 el.textContent = text;
@@ -747,6 +909,102 @@ LOGIN_PAGE = """
             function showStep(stepId) {
                 document.querySelectorAll(".step").forEach((el) => el.classList.remove("active"));
                 document.getElementById(stepId).classList.add("active");
+            }
+
+            function setMode(mode) {
+                clearMessage();
+                document.getElementById("tab-phone").classList.toggle("active", mode === "phone");
+                document.getElementById("tab-qr").classList.toggle("active", mode === "qr");
+
+                if (mode === "qr") {
+                    showStep("step-qr");
+                    startQrPolling();
+                } else {
+                    stopQrPolling();
+                    showStep("step-phone");
+                }
+            }
+
+            function startQrPolling() {
+                if (qrPolling) {
+                    return;
+                }
+                qrPolling = true;
+                pollQr();
+            }
+
+            function stopQrPolling() {
+                qrPolling = false;
+                if (qrTimer) {
+                    clearTimeout(qrTimer);
+                    qrTimer = null;
+                }
+            }
+
+            function renderQr(url) {
+                if (url === qrLastUrl) {
+                    return;
+                }
+                qrLastUrl = url;
+
+                document.getElementById("qr-loading").style.display = "none";
+
+                if (!qrObject) {
+                    qrObject = new QRCode(document.getElementById("qr-code"), {
+                    text: url,
+                    width: 216,
+                    height: 216,
+                    colorDark: "#000000",
+                    colorLight: "#ffffff",
+                    correctLevel: QRCode.CorrectLevel.M,
+                    });
+                } else {
+                    qrObject.clear();
+                    qrObject.makeCode(url);
+                }
+            }
+
+            async function pollQr() {
+                if (!qrPolling) {
+                    return;
+                }
+
+                try {
+                    const response = await fetch("/auth/qr_status");
+                    const result = await response.json();
+
+                    if (!qrPolling) {
+                    return;
+                    }
+
+                    if (result.authorized) {
+                    stopQrPolling();
+                    showMessage("Login successful! Loading player...", "success");
+                    setTimeout(() => window.location.reload(), 1000);
+                    return;
+                    }
+
+                    if (result.need_password) {
+                    stopQrPolling();
+                    document.getElementById("tab-qr").classList.remove("active");
+                    showStep("step-password");
+                    showMessage("QR code accepted. Please enter your cloud password.", "success");
+                    return;
+                    }
+
+                    if (result.error) {
+                    showMessage(result.error, "error");
+                    } else if (result.url) {
+                    clearMessage();
+                    renderQr(result.url);
+                    }
+                } catch (error) {
+                    showMessage("Network error while waiting for the QR code scan.", "error");
+                }
+
+                if (qrPolling) {
+                    qrTimer = setTimeout(pollQr, 3000);
+                }
             }
 
             async function sendCode() {
