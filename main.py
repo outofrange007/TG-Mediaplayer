@@ -1,11 +1,14 @@
 import os
 import json
 import random
+import asyncio
 from collections import OrderedDict
+from urllib.parse import quote
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Query
 from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
 from pyrogram import Client
+from pyrogram.enums import ChatType
 from pyrogram.types import Message
 from pyrogram.errors import (
     SessionPasswordNeeded,
@@ -17,15 +20,16 @@ from pyrogram.errors import (
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
-CHAT_ID = int(os.environ["CHAT_ID"])
+DEFAULT_CHAT_ID = int(os.environ["CHAT_ID"])  # used until another chat is selected in the UI
 
 DATA_PATH = os.getenv("DATA_PATH", "/app/data")
 SESSION_NAME = os.getenv("SESSION_NAME", "media_player_session")
 
 os.makedirs(DATA_PATH, exist_ok=True)
 
-# file used to persist the media list (with metadata) between restarts
-CACHE_FILE = os.path.join(DATA_PATH, "media_cache.json")
+CACHE_VERSION = 2
+CHATS_FILE = os.path.join(DATA_PATH, "chats_cache.json")
+SETTINGS_FILE = os.path.join(DATA_PATH, "settings.json")
 
 tg = Client(
     SESSION_NAME,
@@ -36,12 +40,19 @@ tg = Client(
 
 app = FastAPI()
 
-# media list: plain dicts {id, name, type, size, mime} - no Telegram calls needed to build it
+# currently selected chat and its media list (plain dicts, no Telegram calls needed)
+current_chat_id: int = DEFAULT_CHAT_ID
+current_chat_title: str = ""
 media_items: list[dict] = []
+
+# list of selectable groups/channels (persisted, refreshed on demand)
+chats_list: list[dict] = []
 
 # small LRU cache of Message objects, only used for streaming
 message_cache: "OrderedDict[int, Message]" = OrderedDict()
 MESSAGE_CACHE_LIMIT = 50
+
+scan_lock = asyncio.Lock()
 
 # login state (used only while the Telegram session is not yet authorized)
 is_authorized = False
@@ -49,72 +60,185 @@ login_phone_number: str | None = None
 login_phone_code_hash: str | None = None
 login_needs_password = False
 
+MEDIA_TYPES = ("video", "audio", "image", "file")
 
-def message_to_item(msg: Message) -> dict:
-    file_obj = msg.video or msg.audio
+
+# ---------------------------------------------------------------- helpers
+
+def write_json(path: str, data) -> None:
+    tmp_file = path + ".tmp"
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp_file, path)  # atomic write
+
+
+def read_json(path: str):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def cache_file_for(chat_id: int) -> str:
+    return os.path.join(DATA_PATH, f"media_cache_{chat_id}.json")
+
+
+def classify(msg: Message):
+    """Returns (kind, file_object) for supported messages, otherwise None."""
+    if msg.video:
+        return "video", msg.video
+    if msg.video_note:
+        return "video", msg.video_note
+    if msg.animation:
+        return "video", msg.animation
+    if msg.audio:
+        return "audio", msg.audio
+    if msg.voice:
+        return "audio", msg.voice
+    if msg.photo:
+        return "image", msg.photo
+    if msg.document:
+        mime = (msg.document.mime_type or "").lower()
+        if mime.startswith("video/"):
+            return "video", msg.document
+        if mime.startswith("audio/"):
+            return "audio", msg.document
+        if mime.startswith("image/"):
+            return "image", msg.document
+        return "file", msg.document
+    return None
+
+
+def message_to_item(msg: Message) -> dict | None:
+    result = classify(msg)
+    if not result:
+        return None
+
+    kind, obj = result
+    default_mime = {
+        "image": "image/jpeg",
+        "video": "video/mp4",
+        "audio": "audio/mpeg",
+    }.get(kind, "application/octet-stream")
+    default_ext = {"image": ".jpg", "video": ".mp4", "audio": ".mp3"}.get(kind, "")
+
     return {
         "id": msg.id,
-        "name": file_obj.file_name or f"File {msg.id}",
-        "type": "video" if msg.video else "audio",
-        "size": file_obj.file_size or 0,
-        "mime": file_obj.mime_type or "application/octet-stream",
+        "name": getattr(obj, "file_name", None) or f"{kind.capitalize()} {msg.id}{default_ext}",
+        "type": kind,
+        "size": getattr(obj, "file_size", 0) or 0,
+        "mime": getattr(obj, "mime_type", None) or default_mime,
     }
 
 
-def save_cache_to_disk():
-    """Persists the full media list (including metadata) to disk."""
-    tmp_file = CACHE_FILE + ".tmp"
-    with open(tmp_file, "w", encoding="utf-8") as f:
-        json.dump(media_items, f)
-    os.replace(tmp_file, CACHE_FILE)  # atomic write
+def save_cache_to_disk(chat_id: int, title: str, items: list[dict]) -> None:
+    write_json(
+        cache_file_for(chat_id),
+        {"version": CACHE_VERSION, "chat_id": chat_id, "title": title, "items": items},
+    )
 
 
-def load_cache_from_disk() -> bool:
-    """
-    Loads the media list from disk. Returns False if there is no usable cache
-    (missing, corrupt, or old format that only contained message IDs).
-    """
-    global media_items
+def load_cache_from_disk(chat_id: int) -> bool:
+    """Loads the media list of a chat from disk. Returns False if no valid cache exists."""
+    global media_items, current_chat_title
 
-    if not os.path.exists(CACHE_FILE):
+    data = read_json(cache_file_for(chat_id))
+    if not isinstance(data, dict) or data.get("version") != CACHE_VERSION:
+        return False
+    if not isinstance(data.get("items"), list):
         return False
 
-    try:
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        return False
-
-    if not isinstance(data, list) or not data or not isinstance(data[0], dict):
-        return False
-
-    media_items = data
+    media_items = data["items"]
+    current_chat_title = data.get("title") or str(chat_id)
+    message_cache.clear()
     return True
 
 
-async def scan_telegram_media():
-    """Full scan of the chat history (slow, rate-limited). Only runs on first start or on manual refresh."""
-    global media_items
-
-    async for _ in tg.get_dialogs():  # ensures peer/access_hash is cached
-        pass
-
-    found = []
-    async for msg in tg.get_chat_history(CHAT_ID):
-        if msg.video or msg.audio:
-            found.append(message_to_item(msg))
-    found.reverse()
-
-    media_items = found
-    message_cache.clear()
-    save_cache_to_disk()
+def save_settings() -> None:
+    write_json(SETTINGS_FILE, {"chat_id": current_chat_id})
 
 
-async def load_media_cache():
-    """Instant startup if a valid cache exists; otherwise one full scan."""
-    if load_cache_from_disk():
+def load_settings() -> None:
+    global current_chat_id
+    data = read_json(SETTINGS_FILE)
+    if isinstance(data, dict) and isinstance(data.get("chat_id"), int):
+        current_chat_id = data["chat_id"]
+
+
+def load_chats_from_disk() -> None:
+    global chats_list
+    data = read_json(CHATS_FILE)
+    if isinstance(data, list):
+        chats_list = data
+
+
+async def fetch_chats() -> None:
+    """Loads all groups/channels of the account (only on first use or on manual reload)."""
+    global chats_list
+
+    result = []
+    async for dialog in tg.get_dialogs():
+        chat = dialog.chat
+        if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL):
+            result.append(
+                {
+                    "id": chat.id,
+                    "title": chat.title or str(chat.id),
+                    "type": "channel" if chat.type == ChatType.CHANNEL else "group",
+                }
+            )
+    result.sort(key=lambda c: c["title"].lower())
+    chats_list = result
+    write_json(CHATS_FILE, chats_list)
+
+
+async def resolve_title(chat_id: int) -> str:
+    for chat in chats_list:
+        if chat["id"] == chat_id:
+            return chat["title"]
+    try:
+        chat = await tg.get_chat(chat_id)
+        return chat.title or chat.first_name or str(chat_id)
+    except Exception:
+        return str(chat_id)
+
+
+# ---------------------------------------------------------------- scanning
+
+async def scan_telegram_media(chat_id: int | None = None) -> None:
+    """Full scan of a chat history (slow, rate-limited). Only runs on first use or on manual refresh."""
+    global media_items, current_chat_title
+
+    chat_id = chat_id if chat_id is not None else current_chat_id
+
+    async with scan_lock:
+        async for _ in tg.get_dialogs():  # ensures peer/access_hash is cached
+            pass
+
+        title = await resolve_title(chat_id)
+
+        found = []
+        async for msg in tg.get_chat_history(chat_id):
+            item = message_to_item(msg)
+            if item:
+                found.append(item)
+        found.reverse()
+
+        save_cache_to_disk(chat_id, title, found)
+
+        # only apply if the user did not switch to another chat in the meantime
+        if chat_id == current_chat_id:
+            media_items = found
+            current_chat_title = title
+            message_cache.clear()
+
+
+async def load_media_cache() -> None:
+    """Instant if a valid cache exists for the current chat; otherwise one full scan."""
+    if load_cache_from_disk(current_chat_id):
         return
-    await scan_telegram_media()
+    await scan_telegram_media(current_chat_id)
 
 
 async def get_message(message_id: int) -> Message | None:
@@ -124,14 +248,14 @@ async def get_message(message_id: int) -> Message | None:
         return message_cache[message_id]
 
     try:
-        msg = await tg.get_messages(CHAT_ID, message_id)
+        msg = await tg.get_messages(current_chat_id, message_id)
     except Exception:
         # peer might not be known yet in the session -> load dialogs once and retry
         async for _ in tg.get_dialogs():
             pass
-        msg = await tg.get_messages(CHAT_ID, message_id)
+        msg = await tg.get_messages(current_chat_id, message_id)
 
-    if not msg or not (msg.video or msg.audio):
+    if not msg or not classify(msg):
         return None
 
     message_cache[message_id] = msg
@@ -143,6 +267,9 @@ async def get_message(message_id: int) -> Message | None:
 @app.on_event("startup")
 async def startup():
     global is_authorized
+
+    load_settings()
+    load_chats_from_disk()
 
     # connect() returns True if the stored session is already authorized
     is_authorized = await tg.connect()
@@ -159,8 +286,7 @@ async def shutdown():
 
 
 # ----
-# Login endpoints (phone number / code / 2FA password), used when the
-# Telegram session is not yet authorized.
+# Login endpoints (phone number / code / 2FA password)
 # ----
 
 @app.post("/auth/send_code")
@@ -240,24 +366,92 @@ async def auth_status():
     return JSONResponse({"authorized": is_authorized})
 
 
-@app.post("/api/refresh")
-async def refresh_media():
-    """Triggers a full re-scan of the Telegram chat and updates the cache on disk."""
+# ----
+# Chat selection / state
+# ----
+
+@app.get("/api/chats")
+async def api_chats(refresh: bool = False):
     if not is_authorized:
         return JSONResponse({"error": "not authorized"}, status_code=401)
 
-    await scan_telegram_media()
+    if refresh or not chats_list:
+        try:
+            await fetch_chats()
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    return JSONResponse(
+        {"current": current_chat_id, "current_title": current_chat_title, "chats": chats_list}
+    )
+
+
+@app.post("/api/chat")
+async def api_select_chat(request: Request):
+    """Switches to another group/channel. Uses its cache or performs a first scan."""
+    global current_chat_id, current_chat_title, media_items
+
+    if not is_authorized:
+        return JSONResponse({"error": "not authorized"}, status_code=401)
+
+    data = await request.json()
+    try:
+        chat_id = int(data.get("chat_id"))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "Invalid chat id."}, status_code=400)
+
+    previous = (current_chat_id, current_chat_title, media_items)
+
+    current_chat_id = chat_id
+    try:
+        await load_media_cache()
+    except Exception as exc:
+        current_chat_id, current_chat_title, media_items = previous
+        message_cache.clear()
+        return JSONResponse({"error": f"Could not open this chat: {exc}"}, status_code=400)
+
+    save_settings()
+    return JSONResponse({"success": True, "chat_id": current_chat_id, "title": current_chat_title})
+
+
+@app.get("/api/state")
+async def api_state():
+    if not is_authorized:
+        return JSONResponse({"error": "not authorized"}, status_code=401)
+
+    counts = {t: 0 for t in MEDIA_TYPES}
+    for item in media_items:
+        counts[item["type"]] = counts.get(item["type"], 0) + 1
+    counts["all"] = len(media_items)
+
+    return JSONResponse(
+        {"chat_id": current_chat_id, "title": current_chat_title, "counts": counts}
+    )
+
+
+@app.post("/api/refresh")
+async def refresh_media():
+    """Triggers a full re-scan of the selected chat and updates its cache on disk."""
+    if not is_authorized:
+        return JSONResponse({"error": "not authorized"}, status_code=401)
+
+    try:
+        await scan_telegram_media(current_chat_id)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
     return JSONResponse({"success": True, "count": len(media_items)})
 
 
 @app.get("/api/playlist")
-async def playlist(shuffle: bool = False):
+async def playlist(shuffle: bool = False, media_type: str = Query("all", alias="type")):
     if not is_authorized:
         return JSONResponse({"error": "not authorized"}, status_code=401)
 
     items = [
         {"id": i["id"], "name": i["name"], "type": i["type"], "size": i["size"]}
         for i in media_items
+        if media_type == "all" or i["type"] == media_type
     ]
     if shuffle:
         random.shuffle(items)
@@ -268,7 +462,7 @@ CHUNK_SIZE = 1024 * 1024  # Telegram requires offsets aligned to 1 MB
 
 
 @app.get("/media/{message_id}")
-async def stream(message_id: int, request: Request):
+async def stream(message_id: int, request: Request, download: bool = False):
     if not is_authorized:
         return JSONResponse({"error": "not authorized"}, status_code=401)
 
@@ -276,11 +470,14 @@ async def stream(message_id: int, request: Request):
     if not item:
         return JSONResponse({"error": "not found"}, status_code=404)
 
+    file_size = item["size"]
+    if file_size <= 0:
+        return JSONResponse({"error": "unknown file size"}, status_code=404)
+
     msg = await get_message(message_id)
     if not msg:
         return JSONResponse({"error": "message no longer available"}, status_code=404)
 
-    file_size = item["size"]
     mime_type = item["mime"]
 
     range_header = request.headers.get("range")
@@ -291,6 +488,7 @@ async def stream(message_id: int, request: Request):
         range_value = range_header.replace("bytes=", "").split("-")
         start = int(range_value[0]) if range_value[0] else 0
         end = int(range_value[1]) if len(range_value) > 1 and range_value[1] else file_size - 1
+        end = min(end, file_size - 1)
 
     # align offset down to the nearest chunk boundary (required by Telegram)
     aligned_offset = (start // CHUNK_SIZE) * CHUNK_SIZE
@@ -320,6 +518,9 @@ async def stream(message_id: int, request: Request):
         "Accept-Ranges": "bytes",
         "Content-Length": str(bytes_to_send),
     }
+    if download:
+        headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{quote(item['name'])}"
+
     status_code = 206 if range_header else 200
 
     return StreamingResponse(
@@ -705,6 +906,11 @@ PLAYER_PAGE = """
                 font-size: 0.95rem;
             }
 
+            .subtitle strong {
+                color: #6ca6fd;
+                font-weight: 500;
+            }
+
             .section {
                 background: rgba(255, 255, 255, 0.03);
                 backdrop-filter: blur(10px);
@@ -722,6 +928,35 @@ PLAYER_PAGE = """
                 display: flex;
                 align-items: center;
                 gap: 10px;
+            }
+
+            .field-label {
+                display: block;
+                margin-bottom: 8px;
+                color: #8899a6;
+                font-size: 0.9rem;
+            }
+
+            .chat-row {
+                display: flex;
+                gap: 10px;
+                margin-bottom: 20px;
+            }
+
+            select {
+                flex: 1;
+                min-width: 0;
+                padding: 11px 14px;
+                border-radius: 6px;
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                background: #242424;
+                color: #e0e0e0;
+                font-size: 1rem;
+            }
+
+            select:focus {
+                outline: none;
+                border-color: rgba(108, 166, 253, 0.6);
             }
 
             .button-row {
@@ -743,6 +978,7 @@ PLAYER_PAGE = """
                 display: inline-flex;
                 align-items: center;
                 gap: 8px;
+                text-decoration: none;
             }
 
             .btn:hover {
@@ -764,6 +1000,11 @@ PLAYER_PAGE = """
 
             .btn.spinning i {
                 animation: spin 1s linear infinite;
+            }
+
+            .count {
+                font-size: 0.8rem;
+                opacity: 0.75;
             }
 
             @keyframes spin {
@@ -798,7 +1039,35 @@ PLAYER_PAGE = """
                 background: #000;
             }
 
-            #player-container:fullscreen #player {
+            #image-view {
+                display: none;
+                width: 100%;
+                max-height: 70vh;
+                object-fit: contain;
+                background: #000;
+            }
+
+            #file-panel {
+                display: none;
+                padding: 70px 20px;
+                text-align: center;
+                color: #8899a6;
+            }
+
+            #file-panel i.big {
+                font-size: 3rem;
+                color: #6ca6fd;
+                margin-bottom: 15px;
+            }
+
+            #file-panel .file-name {
+                color: #e0e0e0;
+                margin-bottom: 18px;
+                word-break: break-all;
+            }
+
+            #player-container:fullscreen #player,
+            #player-container:fullscreen #image-view {
                 width: 100%;
                 height: 100%;
                 max-height: none;
@@ -933,6 +1202,10 @@ PLAYER_PAGE = """
                     justify-content: center;
                 }
 
+                .chat-row .btn {
+                    width: auto;
+                }
+
                 #prev-overlay-btn,
                 #next-overlay-btn,
                 #fullscreen-btn {
@@ -949,11 +1222,43 @@ PLAYER_PAGE = """
                     <i class="fas fa-circle-play" style="color: #6ca6fd;"></i>
                     Telegram Media Player
                 </h1>
-                <p class="subtitle">Stream media directly from your Telegram group</p>
+                <p class="subtitle">Streaming from: <strong id="chat-title">...</strong></p>
             </header>
 
             <section class="section">
-                <h2><i class="fas fa-sliders"></i> Playback Controls</h2>
+                <h2><i class="fas fa-sliders"></i> Source &amp; Controls</h2>
+
+                <label class="field-label" for="chat-select">Group / Channel</label>
+                <div class="chat-row">
+                    <select id="chat-select" onchange="changeChat()">
+                    <option>Loading chats...</option>
+                    </select>
+                    <button id="reload-chats-btn" class="btn" title="Reload chat list from Telegram"
+                            onclick="loadChats(true)">
+                    <i class="fas fa-arrows-rotate"></i>
+                    </button>
+                </div>
+
+                <label class="field-label">Media type</label>
+                <div class="button-row" style="margin-bottom: 20px;">
+                    <button class="btn type-btn active" data-type="all" onclick="setType('all')">
+                    <i class="fas fa-layer-group"></i> All <span class="count" id="count-all"></span>
+                    </button>
+                    <button class="btn type-btn" data-type="video" onclick="setType('video')">
+                    <i class="fas fa-film"></i> Videos <span class="count" id="count-video"></span>
+                    </button>
+                    <button class="btn type-btn" data-type="audio" onclick="setType('audio')">
+                    <i class="fas fa-music"></i> Audio <span class="count" id="count-audio"></span>
+                    </button>
+                    <button class="btn type-btn" data-type="image" onclick="setType('image')">
+                    <i class="fas fa-image"></i> Images <span class="count" id="count-image"></span>
+                    </button>
+                    <button class="btn type-btn" data-type="file" onclick="setType('file')">
+                    <i class="fas fa-file"></i> Files <span class="count" id="count-file"></span>
+                    </button>
+                </div>
+
+                <label class="field-label">Playback</label>
                 <div class="button-row">
                     <button id="normal-order-btn" class="btn active" onclick="loadPlaylist(false)">
                     <i class="fas fa-list"></i> Normal Order
@@ -974,6 +1279,15 @@ PLAYER_PAGE = """
 
                 <div id="player-container">
                     <video id="player" controls controlsList="nofullscreen"></video>
+                    <img id="image-view" alt="">
+
+                    <div id="file-panel">
+                        <i class="fas fa-file-arrow-down big"></i>
+                        <div class="file-name" id="file-name"></div>
+                        <a id="file-download" class="btn" href="#">
+                        <i class="fas fa-download"></i> Download
+                        </a>
+                    </div>
 
                     <button id="fullscreen-btn" title="Toggle fullscreen" onclick="toggleFullscreen()">
                     <i class="fas fa-expand"></i>
@@ -1007,6 +1321,130 @@ PLAYER_PAGE = """
             let currentIndex = 0;
             let items = [];
             let shuffleEnabled = false;
+            let mediaType = "all";
+
+            const ICONS = {
+                video: "fa-film",
+                audio: "fa-music",
+                image: "fa-image",
+                file: "fa-file",
+            };
+
+            function setPlaylistMessage(html) {
+                document.getElementById("playlist").innerHTML =
+                    `<li class="empty-playlist">${html}</li>`;
+            }
+
+            async function loadChats(refresh) {
+                const select = document.getElementById("chat-select");
+                const reloadBtn = document.getElementById("reload-chats-btn");
+                reloadBtn.disabled = true;
+                reloadBtn.classList.add("spinning");
+
+                try {
+                    const response = await fetch(`/api/chats?refresh=${refresh}`);
+                    const result = await response.json();
+
+                    if (!response.ok || result.error) {
+                    select.innerHTML = "<option>Could not load chats</option>";
+                    return;
+                    }
+
+                    select.innerHTML = "";
+                    let found = false;
+
+                    result.chats.forEach((chat) => {
+                    const option = document.createElement("option");
+                    option.value = chat.id;
+                    option.textContent = (chat.type === "channel" ? "[Channel] " : "[Group] ") + chat.title;
+                    if (chat.id === result.current) {
+                    option.selected = true;
+                    found = true;
+                    }
+                    select.appendChild(option);
+                    });
+
+                    // current chat is not part of the dialog list (e.g. set via CHAT_ID)
+                    if (!found) {
+                    const option = document.createElement("option");
+                    option.value = result.current;
+                    option.textContent = result.current_title || String(result.current);
+                    option.selected = true;
+                    select.insertBefore(option, select.firstChild);
+                    }
+                } catch (error) {
+                    select.innerHTML = "<option>Could not load chats</option>";
+                } finally {
+                    reloadBtn.disabled = false;
+                    reloadBtn.classList.remove("spinning");
+                }
+            }
+
+            async function loadState() {
+                try {
+                    const response = await fetch("/api/state");
+                    const state = await response.json();
+                    if (!response.ok || state.error) {
+                    return;
+                    }
+
+                    document.getElementById("chat-title").textContent = state.title || state.chat_id;
+                    ["all", "video", "audio", "image", "file"].forEach((key) => {
+                    document.getElementById(`count-${key}`).textContent = `(${state.counts[key] || 0})`;
+                    });
+                } catch (error) {
+                    // keep old values
+                }
+            }
+
+            function setControlsDisabled(disabled) {
+                document.querySelectorAll(".btn, select").forEach((el) => {
+                    el.disabled = disabled;
+                });
+            }
+
+            async function changeChat() {
+                const select = document.getElementById("chat-select");
+                const chatId = parseInt(select.value, 10);
+                if (isNaN(chatId)) {
+                    return;
+                }
+
+                stopPlayback();
+                setControlsDisabled(true);
+                setPlaylistMessage(
+                    '<i class="fas fa-spinner fa-spin"></i> Loading chat... ' +
+                    "The first time this can take a few minutes (Telegram rate limit)."
+                );
+
+                try {
+                    const response = await fetch("/api/chat", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ chat_id: chatId }),
+                    });
+                    const result = await response.json();
+
+                    if (!response.ok || result.error) {
+                    alert(result.error || "Could not switch the chat.");
+                    }
+                } catch (error) {
+                    alert("Network error while switching the chat.");
+                }
+
+                await loadChats(false);
+                await loadState();
+                setControlsDisabled(false);
+                await loadPlaylist(shuffleEnabled);
+            }
+
+            function setType(type) {
+                mediaType = type;
+                document.querySelectorAll(".type-btn").forEach((btn) => {
+                    btn.classList.toggle("active", btn.dataset.type === type);
+                });
+                loadPlaylist(shuffleEnabled);
+            }
 
             async function loadPlaylist(shuffle) {
                 shuffleEnabled = shuffle;
@@ -1014,33 +1452,26 @@ PLAYER_PAGE = """
                 document.getElementById("normal-order-btn").classList.toggle("active", !shuffle);
                 document.getElementById("shuffle-btn").classList.toggle("active", shuffle);
 
-                const playlistElement = document.getElementById("playlist");
-                playlistElement.innerHTML = `
-                    <li class="empty-playlist">
-                    <i class="fas fa-spinner fa-spin"></i> Loading playlist...
-                    </li>
-                `;
+                setPlaylistMessage('<i class="fas fa-spinner fa-spin"></i> Loading playlist...');
 
                 try {
-                    const response = await fetch(`/api/playlist?shuffle=${shuffle}`);
+                    const response = await fetch(`/api/playlist?shuffle=${shuffle}&type=${mediaType}`);
                     items = await response.json();
 
                     currentIndex = 0;
                     renderList();
 
                     if (items.length > 0) {
-                    playItem(0);
+                    playItem(0, true);
                     } else {
+                    stopPlayback();
                     document.getElementById("now-playing").innerHTML =
                     "<strong>Now playing:</strong> No media files found";
                     }
                 } catch (error) {
-                    playlistElement.innerHTML = `
-                    <li class="empty-playlist">
-                    <i class="fas fa-triangle-exclamation"></i>
-                    Could not load the playlist.
-                    </li>
-                    `;
+                    setPlaylistMessage(
+                    '<i class="fas fa-triangle-exclamation"></i> Could not load the playlist.'
+                    );
                 }
             }
 
@@ -1049,17 +1480,13 @@ PLAYER_PAGE = """
                 playlistElement.innerHTML = "";
 
                 if (items.length === 0) {
-                    playlistElement.innerHTML = `
-                    <li class="empty-playlist">
-                    <i class="fas fa-folder-open"></i> No media files found.
-                    </li>
-                    `;
+                    setPlaylistMessage('<i class="fas fa-folder-open"></i> No media files found.');
                     return;
                 }
 
                 items.forEach((item, index) => {
                     const listItem = document.createElement("li");
-                    const icon = item.type === "audio" ? "fa-music" : "fa-film";
+                    const icon = ICONS[item.type] || "fa-file";
 
                     listItem.className = `playlist-item ${index === currentIndex ? "active" : ""}`;
                     listItem.innerHTML = `
@@ -1068,12 +1495,24 @@ PLAYER_PAGE = """
                     <span class="playlist-size">${formatFileSize(item.size)}</span>
                     `;
 
-                    listItem.onclick = () => playItem(index);
+                    listItem.onclick = () => playItem(index, false);
                     playlistElement.appendChild(listItem);
                 });
             }
 
-            function playItem(index) {
+            function stopPlayback() {
+                const player = document.getElementById("player");
+                player.pause();
+                player.removeAttribute("src");
+                player.load();
+
+                document.getElementById("image-view").removeAttribute("src");
+                document.getElementById("player").style.display = "block";
+                document.getElementById("image-view").style.display = "none";
+                document.getElementById("file-panel").style.display = "none";
+            }
+
+            function playItem(index, auto) {
                 if (items.length === 0 || index < 0 || index >= items.length) {
                     return;
                 }
@@ -1082,16 +1521,38 @@ PLAYER_PAGE = """
 
                 const item = items[index];
                 const player = document.getElementById("player");
+                const imageView = document.getElementById("image-view");
+                const filePanel = document.getElementById("file-panel");
                 const nowPlaying = document.getElementById("now-playing");
 
-                player.src = `/media/${item.id}`;
-                player.play().catch(() => {
-                    // Browsers may require a user interaction before playback starts.
-                });
+                // stop whatever was shown before
+                player.pause();
+                player.removeAttribute("src");
+                player.load();
+                imageView.removeAttribute("src");
+                player.style.display = "none";
+                imageView.style.display = "none";
+                filePanel.style.display = "none";
 
-                nowPlaying.innerHTML = `
-                    <strong>Now playing:</strong> ${escapeHtml(item.name)}
-                `;
+                if (item.type === "video" || item.type === "audio") {
+                    player.style.display = "block";
+                    player.src = `/media/${item.id}`;
+                    player.play().catch(() => {
+                    // Browsers may require a user interaction before playback starts.
+                    });
+                } else if (item.type === "image") {
+                    imageView.style.display = "block";
+                    imageView.src = `/media/${item.id}`;
+                    imageView.alt = item.name;
+                } else {
+                    filePanel.style.display = "block";
+                    document.getElementById("file-name").textContent =
+                    `${item.name} (${formatFileSize(item.size)})`;
+                    document.getElementById("file-download").href = `/media/${item.id}?download=true`;
+                }
+
+                const label = item.type === "file" ? "Selected" : "Now playing";
+                nowPlaying.innerHTML = `<strong>${label}:</strong> ${escapeHtml(item.name)}`;
 
                 renderList();
             }
@@ -1102,7 +1563,7 @@ PLAYER_PAGE = """
                 }
 
                 const nextIndex = (currentIndex + 1) % items.length;
-                playItem(nextIndex);
+                playItem(nextIndex, false);
             }
 
             function playPrevious() {
@@ -1111,7 +1572,7 @@ PLAYER_PAGE = """
                 }
 
                 const prevIndex = (currentIndex - 1 + items.length) % items.length;
-                playItem(prevIndex);
+                playItem(prevIndex, false);
             }
 
             async function refreshMedia() {
@@ -1128,6 +1589,7 @@ PLAYER_PAGE = """
                     return;
                     }
 
+                    await loadState();
                     await loadPlaylist(shuffleEnabled);
                 } catch (error) {
                     alert("Network error while refreshing the media list.");
@@ -1167,14 +1629,16 @@ PLAYER_PAGE = """
                 return element.innerHTML;
             }
 
-            document.addEventListener("DOMContentLoaded", () => {
+            document.addEventListener("DOMContentLoaded", async () => {
                 const player = document.getElementById("player");
 
                 player.addEventListener("ended", () => {
                     playNext();
                 });
 
-                loadPlaylist(false);
+                await loadChats(false);
+                await loadState();
+                await loadPlaylist(false);
             });
         </script>
     </body>
